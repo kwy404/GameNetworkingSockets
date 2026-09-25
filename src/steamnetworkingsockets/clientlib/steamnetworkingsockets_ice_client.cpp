@@ -1081,7 +1081,7 @@ bool ICESessionInterface::QueueTURNRequest( uint32 nMsgType, int nEncoding, cons
     return true;
 }
 
-void ICESessionInterface::QueueAllocateRequest( const netadr_t &addrTURNServer, RecvSTUNPacketCallback_t cb, int nEncoding )
+void ICESessionInterface::QueueAllocateRequest( int nTURNServerIdx, RecvSTUNPacketCallback_t cb, int nEncoding )
 {
     // REQUESTED-TRANSPORT: UDP (IANA protocol 17), protocol byte + 3 RFFU bytes
     uint32 uTransport = htonl( 17u << 24 );
@@ -1090,7 +1090,8 @@ void ICESessionInterface::QueueAllocateRequest( const netadr_t &addrTURNServer, 
     reqTransport.m_nLength = 4;
     reqTransport.m_pData   = &uTransport;
 
-    QueueTURNRequest( k_nTURN_AllocateRequest, nEncoding, addrTURNServer, cb, &reqTransport, 1 );
+    if ( QueueTURNRequest( k_nTURN_AllocateRequest, nEncoding, m_session.m_vecTURNServers[ nTURNServerIdx ], cb, &reqTransport, 1 ) )
+        m_pPendingSTUNRequest->m_nServerIdx = nTURNServerIdx;
 }
 
 void ICESessionInterface::QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding )
@@ -1211,7 +1212,10 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 			{
 				netadr_t adr;
 				SteamNetworkingIPAddrToNetAdr( adr, ip );
-				m_vecSTUNServers.push_back( adr );
+
+				// Skip duplicates, so a dead server listed twice is only tried once.
+				if ( index_of( m_vecSTUNServers, adr ) < 0 )
+					m_vecSTUNServers.push_back( adr );
 			}
 		}
 	}
@@ -1235,6 +1239,11 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 		{
 			netadr_t adr;
 			SteamNetworkingIPAddrToNetAdr( adr, ip );
+
+			// Skip duplicates, keeping the first entry's credentials.  Credentials
+			// are looked up by address, so a later duplicate could never use its own.
+			if ( index_of( m_vecTURNServers, adr ) >= 0 )
+				continue;
 			m_vecTURNServers.push_back( adr );
 			TURNCredentials cred;
 			cred.m_strUsername = pszUsername;
@@ -1957,12 +1966,13 @@ void CSteamNetworkingICESession::Think_DiscoverServerReflexiveCandidates()
             continue;
 
         // Find the first STUN server matching this interface's address family.
-        for ( const netadr_t &srv : m_vecSTUNServers )
+        for ( int idx = 0; idx < len( m_vecSTUNServers ); ++idx )
         {
-            if ( srv.GetType() == pIntf->m_boundAddr.GetType() )
+            if ( m_vecSTUNServers[idx].GetType() == pIntf->m_boundAddr.GetType() )
             {
                 ++TEST_ICE_ctr_srflx_send;
-                pIntf->QueueBindRequest( srv, &CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveCandidate, m_nEncoding | kSTUNPacketEncodingFlags_MappedAddress );
+                pIntf->QueueBindRequest( m_vecSTUNServers[idx], &CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveCandidate, m_nEncoding | kSTUNPacketEncodingFlags_MappedAddress );
+                pIntf->m_pPendingSTUNRequest->m_nServerIdx = idx;
                 break;
             }
         }
@@ -1985,11 +1995,11 @@ void CSteamNetworkingICESession::Think_DiscoverRelayCandidate()
             continue;
 
         // Find the first TURN server matching this interface's address family.
-        for ( const netadr_t &srv : m_vecTURNServers )
+        for ( int idx = 0; idx < len( m_vecTURNServers ); ++idx )
         {
-            if ( srv.GetType() == pIntf->m_boundAddr.GetType() )
+            if ( m_vecTURNServers[idx].GetType() == pIntf->m_boundAddr.GetType() )
             {
-                pIntf->QueueAllocateRequest( srv, &CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay, m_nEncoding );
+                pIntf->QueueAllocateRequest( idx, &CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay, m_nEncoding );
                 break;
             }
         }
@@ -2067,7 +2077,7 @@ void CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay( const RecvST
                             CUtlNetAdrRender( info.m_pRequest->m_remoteAddr ).String(), cred.m_strUsername.c_str() );
 
                         // Re-queue the allocate with credentials.
-                        pIntf->QueueAllocateRequest( info.m_pRequest->m_remoteAddr, &CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay, m_nEncoding );
+                        pIntf->QueueAllocateRequest( info.m_pRequest->m_nServerIdx, &CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay, m_nEncoding );
                         return;
                     }
                 }
@@ -2081,9 +2091,8 @@ void CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay( const RecvST
     }
 
     // Timed out -- try the next TURN server if available.
-    const int nTURNServerIdx = index_of( m_vecTURNServers, info.m_pRequest->m_remoteAddr );
-    const int nNextTURNServerIdx = nTURNServerIdx + 1;
-    if ( nTURNServerIdx < 0 || nNextTURNServerIdx >= len( m_vecTURNServers ) )
+    const int nNextTURNServerIdx = info.m_pRequest->m_nServerIdx + 1;
+    if ( nNextTURNServerIdx >= len( m_vecTURNServers ) )
     {
         // Exhausted all TURN servers. Mark failed.
         pIntf->m_addrTURNServer = info.m_pRequest->m_remoteAddr;
@@ -2092,7 +2101,7 @@ void CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay( const RecvST
     }
 
     // Try the next TURN server.
-    pIntf->QueueAllocateRequest( m_vecTURNServers[nNextTURNServerIdx], &CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay, m_nEncoding );
+    pIntf->QueueAllocateRequest( nNextTURNServerIdx, &CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay, m_nEncoding );
 }
 
 void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const RecvSTUNPktInfo_t &info )
@@ -2294,9 +2303,8 @@ void CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveCandidate( c
     }
 
     // Timed out to this STUN server -- try the next one if available.
-    const int nSTUNServerIdx = index_of( m_vecSTUNServers, info.m_pRequest->m_remoteAddr );
-    const int nNextSTUNServerIdx = nSTUNServerIdx + 1;
-    if ( nSTUNServerIdx < 0 || nNextSTUNServerIdx >= len( m_vecSTUNServers ) )
+    const int nNextSTUNServerIdx = info.m_pRequest->m_nServerIdx + 1;
+    if ( nNextSTUNServerIdx >= len( m_vecSTUNServers ) )
     {
         // Exhausted all STUN servers.  Mark failed so Think_DiscoverServerReflexiveCandidates
         // does not retry this interface indefinitely.
@@ -2307,6 +2315,7 @@ void CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveCandidate( c
 
     // Try the next server
     pIntf->QueueBindRequest( m_vecSTUNServers[nNextSTUNServerIdx], &CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveCandidate, m_nEncoding );
+    pIntf->m_pPendingSTUNRequest->m_nServerIdx = nNextSTUNServerIdx;
 }
 
 void CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveKeepAlive( const RecvSTUNPktInfo_t &info )
@@ -2329,9 +2338,9 @@ void CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveKeepAlive( c
     if ( m_vecSTUNServers.empty() )
         return;
 
-    const int nSTUNServerIdx = std::max( 0, index_of( m_vecSTUNServers, info.m_pRequest->m_remoteAddr ) );
-    const int nNextSTUNServerIdx = ( nSTUNServerIdx + 1 ) % len( m_vecSTUNServers );
+    const int nNextSTUNServerIdx = ( info.m_pRequest->m_nServerIdx + 1 ) % len( m_vecSTUNServers );
     pIntf->QueueBindRequest( m_vecSTUNServers[ nNextSTUNServerIdx ], &CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveKeepAlive, m_nEncoding );
+    pIntf->m_pPendingSTUNRequest->m_nServerIdx = nNextSTUNServerIdx;
 }
 
 void CSteamNetworkingICESession::UpdateKeepalive( ICESessionInterface *pIntf )
@@ -2342,6 +2351,7 @@ void CSteamNetworkingICESession::UpdateKeepalive( ICESessionInterface *pIntf )
         return;
 
     pIntf->QueueBindRequest( pIntf->m_addrSTUNServer, &CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveKeepAlive, m_nEncoding );
+    pIntf->m_pPendingSTUNRequest->m_nServerIdx = std::max( 0, index_of( m_vecSTUNServers, pIntf->m_addrSTUNServer ) );
 }
 
 void CSteamNetworkingICESession::Think_KeepAliveOnCandidates( SteamNetworkingMicroseconds usecNow )
